@@ -88,7 +88,7 @@ def __read_ad_password():
             logging.exception("Could not retrieve secret from Secret Manager: %s" % e)
             raise e
 
-def __connect_to_activedirectory():
+def __connect_to_activedirectory(ad_site):
     domain = __read_required_setting("AD_DOMAIN")
 
     if "AD_DOMAINCONTROLLER" in os.environ:
@@ -97,7 +97,7 @@ def __connect_to_activedirectory():
     else:
         # Look up DC in DNS.
         domain_controllers = ad.domain.ActiveDirectoryConnection.locate_domain_controllers(
-            domain)
+            domain, ad_site)
 
     # If we used SRV records to look up domain controllers, then it is possible that
     # the highest-priority one is offline. So loop over the records to fine one
@@ -141,6 +141,9 @@ def __is_gke_nodepool_member(gce_instance):
     return ("labels" in gce_instance.keys() and 'goog-gke-node' in gce_instance["labels"])
 
 def __shorten_computer_name(computer_name, gce_instance):
+    # Initialize hasher with a 2-byte size
+    hasher = blake2b(digest_size=2)
+
     # We can shorten the name of instances if they are part of a MIG
     if __get_managed_instance_group_for_instance(gce_instance):
         if __is_gke_nodepool_member(gce_instance):
@@ -161,10 +164,11 @@ def __shorten_computer_name(computer_name, gce_instance):
             instance_name_parts = computer_name.rsplit('-', 1)
             mig_name = instance_name_parts[-2]
             unique_id = instance_name_parts[-1]
+
             # Create a hash that produces 4 hex characters
-            hasher = blake2b(digest_size=2)
             hasher.update(mig_name.encode("utf-8"))
             mig_name_hash = hasher.hexdigest()
+
             # Get first 5 characters from MIG's name
             mig_name_prefix = mig_name[:5]
             new_computer_name = ("%s-%s-%s" % (mig_name_prefix, mig_name_hash, unique_id))        
@@ -172,13 +176,12 @@ def __shorten_computer_name(computer_name, gce_instance):
         # Not MIG - create a name using the convention XXXXXXXXXX-YYYY
         # X - partial instance name
         # Y - hashed value of instance name
-        hasher = blake2b(digest_size=3)
         hasher.update(computer_name.encode("utf-8"))
         instance_name_hash = hasher.hexdigest()
         instance_name_prefix = computer_name[:10]
         new_computer_name = ("%s-%s" % (instance_name_prefix, instance_name_hash))
+        
     return new_computer_name
-
 
 def __get_computer_ou_from_metadata(gce_instance):
     gce_instance_name = gce_instance["name"]
@@ -249,18 +252,17 @@ HTTP_CONFLICT = 409
 HTTP_INTERNAL_SERVER_ERROR = 500
 HTTP_BAD_GATEWAY = 502
 
-def __serve_join_script(request):
+def __serve_join_script(request, ad_domain):
     """
     Return the PowerShell script to be run on the joining computer. The script
     does not contain any information about the AD domain or infrastructure so that
     it is safe to provide it without authentication.
     """
     with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "join.ps1"), 'r') as file:
-        join_script = file.read().replace(
-            "%domain%",
-            request.host).replace(
-            "%scheme%",
-            __get_request_scheme(request))
+        join_script = file.read()
+        join_script = join_script.replace("%domain%", request.host)
+        join_script = join_script.replace("%scheme%", __get_request_scheme(request))
+        join_script = join_script.replace("%ad_domain%", ad_domain)
 
         return flask.Response(join_script, mimetype='text/plain')
 
@@ -288,7 +290,8 @@ def __register_computer(request):
 
     # Connect to Active Directory so that we can authorize the request.
     try:
-        ad_connection = __connect_to_activedirectory()
+        ad_site = request.args.get("ad_site")
+        ad_connection = __connect_to_activedirectory(ad_site)
     except Exception as e:
         logging.exception("Connecting to Active Directory failed")
         return flask.abort(HTTP_BAD_GATEWAY, description="CONNECT_TO_AD_FAILED")
@@ -694,7 +697,7 @@ def register_computer(request):
     elif request.path == "/cleanup" and request.method == "POST":
         return __cleanup_computers(request)
     elif request.path == "/" and request.method == "GET":
-        return __serve_join_script(request)
+        return __serve_join_script(request, __read_required_setting("AD_DOMAIN"))
     elif request.path == "/" and request.method == "POST":
         return __register_computer(request)
     else:
